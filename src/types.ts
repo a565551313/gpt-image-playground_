@@ -113,6 +113,8 @@ export interface AppSettings {
   agentApiConfigMode: AgentApiConfigMode
   agentTextProfileId?: string | null
   agentImageProfileId?: string | null
+  agentTextProfileIds?: string[]
+  agentImageProfileIds?: string[]
   profiles: ApiProfile[]
   activeProfileId: string
 }

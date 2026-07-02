@@ -19,6 +19,8 @@ interface AgentSettingsTabProps {
   agentImageProfileOptions: SelectOption[]
   selectedAgentTextProfile: ApiProfile | null
   selectedAgentImageProfile: ApiProfile | null
+  agentTextProfileIds: string[]
+  agentImageProfileIds: string[]
   setAgentMaxToolRoundsInput: (value: string) => void
   updateAgentApiConfigMode: (mode: AgentApiConfigMode) => void
   commitSettings: (nextDraft: AppSettings) => void
@@ -30,13 +32,92 @@ export default function AgentSettingsTab({
   agentMaxToolRoundsInput,
   agentTextProfileOptions,
   agentImageProfileOptions,
-  selectedAgentTextProfile,
-  selectedAgentImageProfile,
+  agentTextProfileIds,
+  agentImageProfileIds,
   setAgentMaxToolRoundsInput,
   updateAgentApiConfigMode,
   commitSettings,
   commitAgentMaxToolRounds,
 }: AgentSettingsTabProps) {
+  const toggleTextProfileId = (profileId: string) => {
+    const current = [...agentTextProfileIds]
+    const idx = current.indexOf(profileId)
+    if (idx >= 0) {
+      if (current.length <= 1) return
+      current.splice(idx, 1)
+    } else {
+      current.push(profileId)
+    }
+    commitSettings({ ...draft, agentTextProfileIds: current })
+  }
+
+  const toggleImageProfileId = (profileId: string) => {
+    const current = [...agentImageProfileIds]
+    const idx = current.indexOf(profileId)
+    if (idx >= 0) {
+      if (current.length <= 1) return
+      current.splice(idx, 1)
+    } else {
+      current.push(profileId)
+    }
+    commitSettings({ ...draft, agentImageProfileIds: current })
+  }
+
+  const renderCheckboxList = (
+    options: SelectOption[],
+    selectedIds: string[],
+    onToggle: (id: string) => void,
+  ) => {
+    if (options.length === 0) {
+      return (
+        <div className="w-full rounded-xl border border-gray-200/60 bg-white/50 px-3 py-1.5 text-center text-xs text-gray-700 shadow-sm transition-all duration-200 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200">
+          没有可用配置
+        </div>
+      )
+    }
+    return (
+      <div className="max-h-60 overflow-y-auto rounded-xl border border-gray-200/60 bg-white/50 dark:border-white/[0.08] dark:bg-white/[0.03] custom-scrollbar">
+        {options.map((opt, idx) => {
+          const checked = selectedIds.includes(opt.value)
+          return (
+            <div
+              key={opt.value}
+              className={`flex items-center gap-2 px-3 py-2 text-xs transition-colors ${
+                checked
+                  ? 'bg-blue-50/60 dark:bg-blue-500/10'
+                  : 'hover:bg-gray-50/80 dark:hover:bg-white/[0.04]'
+              } ${idx > 0 ? 'border-t border-gray-200/40 dark:border-white/[0.06]' : ''}`}
+            >
+              <button
+                type="button"
+                onClick={() => onToggle(opt.value)}
+                className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border transition-colors ${
+                  checked
+                    ? 'border-blue-500 bg-blue-500 text-white'
+                    : 'border-gray-300 bg-white dark:border-white/15 dark:bg-white/5'
+                }`}
+              >
+                {checked && (
+                  <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                  </svg>
+                )}
+              </button>
+              <span className={`flex-1 truncate ${checked ? 'text-gray-800 dark:text-gray-100' : 'text-gray-500 dark:text-gray-400'}`}>
+                {opt.label}
+              </span>
+              {checked && (
+                <span className="shrink-0 text-[10px] text-blue-400 dark:text-blue-500">
+                  #{selectedIds.indexOf(opt.value) + 1}
+                </span>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-4">
       <div className="block">
@@ -65,42 +146,28 @@ export default function AgentSettingsTab({
         <>
           <div className="block">
             <div className="mb-1 flex items-center justify-between gap-3">
-              <span className="block text-sm text-gray-600 dark:text-gray-300">文本模型 API 配置</span>
-              <div className="w-40 shrink-0">
-                {agentTextProfileOptions.length > 0 ? (
-                  <Select
-                    value={selectedAgentTextProfile?.id ?? ''}
-                    onChange={(value) => commitSettings({ ...draft, agentTextProfileId: String(value) })}
-                    options={agentTextProfileOptions}
-                    className="w-full px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] bg-white/50 dark:bg-white/[0.03] hover:bg-white dark:hover:bg-white/[0.06] text-xs transition-all duration-200 shadow-sm text-gray-700 dark:text-gray-200 outline-none"
-                  />
-                ) : (
-                  <div className="w-full rounded-xl border border-gray-200/60 bg-white/50 px-3 py-1.5 text-center text-xs text-gray-700 shadow-sm transition-all duration-200 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200">
-                    没有可用配置
-                  </div>
-                )}
-              </div>
+              <span className="block text-sm text-gray-600 dark:text-gray-300">
+                文本模型 API 配置
+                <span className="ml-1 text-xs text-gray-400 dark:text-gray-500">（多选，按勾选顺序依次为备选）</span>
+              </span>
             </div>
-            <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
-              用于对话和调用工具，仅支持 Responses API 配置。
+            {renderCheckboxList(agentTextProfileOptions, agentTextProfileIds, toggleTextProfileId)}
+            <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
+              用于对话和调用工具，仅支持 Responses API 配置。勾选多个后调用失败时按顺序自动切换下一个重试。
             </div>
           </div>
 
           {draft.agentApiConfigMode === 'hybrid' && (
             <div className="block">
               <div className="mb-1 flex items-center justify-between gap-3">
-                <span className="block text-sm text-gray-600 dark:text-gray-300">图像模型 API 配置</span>
-                <div className="w-40 shrink-0">
-                  <Select
-                    value={selectedAgentImageProfile?.id ?? ''}
-                    onChange={(value) => commitSettings({ ...draft, agentImageProfileId: String(value) })}
-                    options={agentImageProfileOptions}
-                    className="w-full px-3 py-1.5 rounded-xl border border-gray-200/60 dark:border-white/[0.08] bg-white/50 dark:bg-white/[0.03] hover:bg-white dark:hover:bg-white/[0.06] text-xs transition-all duration-200 shadow-sm text-gray-700 dark:text-gray-200 outline-none"
-                  />
-                </div>
+                <span className="block text-sm text-gray-600 dark:text-gray-300">
+                  图像模型 API 配置
+                  <span className="ml-1 text-xs text-gray-400 dark:text-gray-500">（多选，按勾选顺序依次为备选）</span>
+                </span>
               </div>
-              <div data-selectable-text className="text-xs text-gray-500 dark:text-gray-500">
-                用于生成图像，支持所有类型的 API 配置。
+              {renderCheckboxList(agentImageProfileOptions, agentImageProfileIds, toggleImageProfileId)}
+              <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
+                用于生成图像，支持所有类型的 API 配置。勾选多个后调用失败时按顺序自动切换下一个重试。
               </div>
             </div>
           )}

@@ -441,6 +441,13 @@ export default function SettingsModal() {
     label: `${profile.name} · ${getApiProviderLabel(draft, profile.provider)} · ${profile.model}`,
     value: profile.id,
   }))
+  // 多配置轮换：agentTextProfileIds 为空时以上次保存的单个 profile 为默认值
+  const agentTextProfileIds = Array.isArray(draft.agentTextProfileIds) && draft.agentTextProfileIds.length > 0
+    ? draft.agentTextProfileIds
+    : (selectedAgentTextProfile ? [selectedAgentTextProfile.id] : [])
+  const agentImageProfileIds = Array.isArray(draft.agentImageProfileIds) && draft.agentImageProfileIds.length > 0
+    ? draft.agentImageProfileIds
+    : (selectedAgentImageProfile ? [selectedAgentImageProfile.id] : [])
 
   const wasSettingsOpenRef = useRef(false)
 
@@ -846,6 +853,8 @@ export default function SettingsModal() {
       agentApiConfigMode: mode,
       agentTextProfileId: mode !== 'off' ? selectedAgentTextProfile?.id ?? draft.agentTextProfileId : draft.agentTextProfileId,
       agentImageProfileId: mode === 'hybrid' ? selectedAgentImageProfile?.id ?? draft.agentImageProfileId : draft.agentImageProfileId,
+      agentTextProfileIds: mode !== 'off' ? agentTextProfileIds : draft.agentTextProfileIds,
+      agentImageProfileIds: mode === 'hybrid' ? agentImageProfileIds : draft.agentImageProfileIds,
     })
   }
 
@@ -1310,6 +1319,8 @@ export default function SettingsModal() {
                 agentImageProfileOptions={agentImageProfileOptions}
                 selectedAgentTextProfile={selectedAgentTextProfile}
                 selectedAgentImageProfile={selectedAgentImageProfile}
+                agentTextProfileIds={agentTextProfileIds}
+                agentImageProfileIds={agentImageProfileIds}
                 setAgentMaxToolRoundsInput={setAgentMaxToolRoundsInput}
                 updateAgentApiConfigMode={updateAgentApiConfigMode}
                 commitSettings={commitSettings}

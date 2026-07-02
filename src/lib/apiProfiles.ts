@@ -536,6 +536,27 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     ? record.agentImageProfileId
     : active.id
 
+  // 多配置轮换：兼容旧版单值字段。仅保留当前存在的 profile，按数组顺序执行；失败后依次轮换。
+  const validTextProfileIds = profiles.filter(isAgentTextApiProfile).map((p) => p.id)
+  const rawAgentTextProfileIds = Array.isArray(record.agentTextProfileIds)
+    ? (record.agentTextProfileIds as unknown[]).filter((id): id is string => typeof id === 'string' && Boolean(id.trim())).map((id) => id.trim())
+    : []
+  const seenTextIds = new Set<string>()
+  const agentTextProfileIds = rawAgentTextProfileIds
+    .filter((id) => validTextProfileIds.includes(id) && !seenTextIds.has(id) && seenTextIds.add(id))
+    .filter((id) => id !== agentTextProfileId)
+  if (agentTextProfileId && !agentTextProfileIds.includes(agentTextProfileId)) agentTextProfileIds.unshift(agentTextProfileId)
+
+  const validImageProfileIds = profiles.map((p) => p.id)
+  const rawAgentImageProfileIds = Array.isArray(record.agentImageProfileIds)
+    ? (record.agentImageProfileIds as unknown[]).filter((id): id is string => typeof id === 'string' && Boolean(id.trim())).map((id) => id.trim())
+    : []
+  const seenImageIds = new Set<string>()
+  const agentImageProfileIds = rawAgentImageProfileIds
+    .filter((id) => validImageProfileIds.includes(id) && !seenImageIds.has(id) && seenImageIds.add(id))
+    .filter((id) => id !== agentImageProfileId)
+  if (agentImageProfileId && !agentImageProfileIds.includes(agentImageProfileId)) agentImageProfileIds.unshift(agentImageProfileId)
+
   return {
     baseUrl: active.baseUrl,
     apiKey: active.apiKey,
@@ -564,9 +585,38 @@ export function normalizeSettings(input: Partial<AppSettings> | unknown): AppSet
     agentApiConfigMode,
     agentTextProfileId,
     agentImageProfileId,
+    agentTextProfileIds,
+    agentImageProfileIds,
     profiles,
     activeProfileId,
   }
+}
+
+// 按 normalize 后的顺序解析可用于轮换的文本 profile 列表。
+// 旧数据只有 agentTextProfileId 时，返回单元素列表；mode=off 时回退到活动 profile。
+export function getAgentTextApiProfiles(settings: Partial<AppSettings> | unknown): ApiProfile[] {
+  const normalized = normalizeSettings(settings)
+  if (normalized.agentApiConfigMode === 'off') {
+    const active = getActiveApiProfile(normalized)
+    return active ? [active] : []
+  }
+  const ids = normalized.agentTextProfileIds?.length ? normalized.agentTextProfileIds : []
+  const list = ids
+    .map((id) => normalized.profiles.find((p) => p.id === id))
+    .filter((p): p is ApiProfile => Boolean(p))
+  return list.length ? list : []
+}
+
+// 按 normalize 后的顺序解析可用于轮换的图像 profile 列表。
+// hybrid 模式使用 agentImageProfileIds；其它模式复用文本 profile 链。
+export function getAgentImageApiProfiles(settings: Partial<AppSettings> | unknown): ApiProfile[] {
+  const normalized = normalizeSettings(settings)
+  if (normalized.agentApiConfigMode !== 'hybrid') return getAgentTextApiProfiles(normalized)
+  const ids = normalized.agentImageProfileIds?.length ? normalized.agentImageProfileIds : []
+  const list = ids
+    .map((id) => normalized.profiles.find((p) => p.id === id))
+    .filter((p): p is ApiProfile => Boolean(p))
+  return list.length ? list : []
 }
 
 export function getAgentTextApiProfile(settings: Partial<AppSettings> | unknown): ApiProfile | null {

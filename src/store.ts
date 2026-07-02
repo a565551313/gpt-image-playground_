@@ -17,7 +17,7 @@ import type {
   ResponsesOutputItem,
 } from './types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS } from './types'
-import { DEFAULT_SETTINGS, getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, getCustomProviderDefinition, mergeImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
+import { DEFAULT_SETTINGS, createDefaultOpenAIProfile, getActiveApiProfile, getAgentImageApiProfile, getAgentImageApiProfiles, getAgentTextApiProfile, getAgentTextApiProfiles, getCustomProviderDefinition, mergeImportedSettings, normalizeSettings, validateApiProfile } from './lib/apiProfiles'
 import { dismissAllTooltips } from './lib/tooltipDismiss'
 import { remapImageMentionsForOrder, replaceImageMentionsForApi } from './lib/promptImageMentions'
 import {
@@ -42,7 +42,7 @@ import {
   storeImageWithSize,
 } from './lib/db'
 import { callImageApi } from './lib/api'
-import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResultImage } from './lib/agentApi'
+import { callAgentConversationTitleApi, callAgentResponsesApi, callBatchImageSingle, parseBatchImageCallArguments, type AgentApiResult, type AgentApiResultImage } from './lib/agentApi'
 import { collectAgentRoundOutputImageSlots, extractAgentReferenceIds, getAgentCurrentReferenceId, getAgentGeneratedImageReferenceId, replaceAgentPromptImageReferencesForApi } from './lib/agentImageReferences'
 import { showBrowserNotification } from './lib/browserNotification'
 import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
@@ -3500,8 +3500,8 @@ async function continueRecoveredAgentRound(taskId: string) {
       round.id,
       resumeParams,
       createSettingsForApiProfile(normalizedSettings, activeProfile),
-      activeProfile,
-      imageProfile,
+      getAgentTextApiProfiles(normalizedSettings),
+      getAgentImageApiProfiles(normalizedSettings),
       {
         responseOutput: updatedRound.responseOutput ?? [],
         recoveredTaskIds: recovered.recoveredTaskIds,
@@ -3527,6 +3527,8 @@ export async function submitAgentMessage() {
 
   const activeProfile = getAgentTextApiProfile(normalizedSettings)!
   const imageProfile = getAgentImageApiProfile(normalizedSettings)!
+  const textProfiles = getAgentTextApiProfiles(normalizedSettings)
+  const imageProfiles = getAgentImageApiProfiles(normalizedSettings)
 
   const trimmedPrompt = prompt.trim()
   if (!trimmedPrompt) {
@@ -3659,7 +3661,7 @@ export async function submitAgentMessage() {
     void generateAgentConversationTitle(conversation.id, trimmedPrompt, inputImageIds, requestSettings, activeProfile, fallbackTitle)
   }
 
-  void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, activeProfile, imageProfile)
+  void executeAgentRound(conversation.id, roundId, normalizedParams, requestSettings, textProfiles, imageProfiles)
 }
 
 export async function regenerateAgentAssistantMessage(conversationId: string, roundId: string) {
@@ -3676,6 +3678,8 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
 
   const activeProfile = getAgentTextApiProfile(normalizedSettings)!
   const imageProfile = getAgentImageApiProfile(normalizedSettings)!
+  const textProfiles = getAgentTextApiProfiles(normalizedSettings)
+  const imageProfiles = getAgentImageApiProfiles(normalizedSettings)
 
   const conversation = state.agentConversations.find((item) => item.id === conversationId)
   const sourceRound = conversation?.rounds.find((item) => item.id === roundId) ?? null
@@ -3727,7 +3731,7 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
         : current.messages,
     }))
     state.setAgentEditingRoundId(null)
-    void executeAgentRound(conversationId, sourceRound.id, normalizedParams, requestSettings, activeProfile, imageProfile)
+    void executeAgentRound(conversationId, sourceRound.id, normalizedParams, requestSettings, textProfiles, imageProfiles)
     return
   }
 
@@ -3767,7 +3771,7 @@ export async function regenerateAgentAssistantMessage(conversationId: string, ro
     messages: [...current.messages, newUserMessage],
   }))
   state.setAgentEditingRoundId(null)
-  void executeAgentRound(conversationId, newRoundId, normalizedParams, requestSettings, activeProfile, imageProfile)
+  void executeAgentRound(conversationId, newRoundId, normalizedParams, requestSettings, textProfiles, imageProfiles)
 }
 
 async function executeAgentRound(
@@ -3775,10 +3779,17 @@ async function executeAgentRound(
   roundId: string,
   params: TaskParams,
   requestSettings: AppSettings,
-  activeProfile: ApiProfile,
-  imageProfile: ApiProfile,
+  textProfiles: ApiProfile[],
+  imageProfiles: ApiProfile[],
   resume?: { responseOutput: ResponsesOutputItem[]; recoveredTaskIds: string[]; toolCallsUsed: number },
 ) {
+  // 多配置轮换：取首个 profile 作为初始，失败后依次使用后续 profile 重试。
+  if (textProfiles.length === 0) textProfiles = [createDefaultOpenAIProfile()]
+  if (imageProfiles.length === 0) imageProfiles = [createDefaultOpenAIProfile()]
+  const activeProfile = textProfiles[0]
+  const imageProfile = imageProfiles[0]
+  const textFallbackProfiles = textProfiles.slice(1)
+  const imageFallbackProfiles = imageProfiles.slice(1)
   const startedAt = Date.now()
   const controller = new AbortController()
   const controllerKey = getAgentRoundControllerKey(conversationId, roundId)
@@ -3801,7 +3812,11 @@ async function executeAgentRound(
     const assistantMessageId = existingAssistantMessage?.id ?? genId()
     const resumedAssistantContent = resume ? existingAssistantMessage?.content.trim() ?? '' : ''
     const shouldStreamAssistantMessage = activeProfile.streamImages === true
-    const imageRequestSettings = createSettingsForApiProfile(requestSettings, imageProfile)
+    // 图像 profile 轮换：imageProfile 可在调用失败后切换到下一个候选配置
+    const imageProfileChain = [imageProfile, ...imageFallbackProfiles]
+    let imageProfileIndex = 0
+    const getImageProfile = () => imageProfileChain[imageProfileIndex]
+    const getImageRequestSettings = () => createSettingsForApiProfile(requestSettings, getImageProfile())
     const streamingTaskIds: string[] = resume ? [...round.outputTaskIds] : []
     const taskIdByToolCallId = new Map<string, string>()
 
@@ -3840,15 +3855,16 @@ async function executeAgentRound(
         return existingTask.id
       }
 
+      const currentImageProfile = getImageProfile()
       const task: TaskRecord = {
         id: genId(),
         prompt: taskPrompt,
         params: options.taskParams ?? { ...params, n: 1 },
-        apiProvider: imageProfile.provider,
-        apiProfileId: imageProfile.id,
-        apiProfileName: imageProfile.name,
-        apiMode: imageProfile.apiMode,
-        apiModel: imageProfile.model,
+        apiProvider: currentImageProfile.provider,
+        apiProfileId: currentImageProfile.id,
+        apiProfileName: currentImageProfile.name,
+        apiMode: currentImageProfile.apiMode,
+        apiModel: currentImageProfile.model,
         inputImageIds,
         maskTargetImageId: options.maskTargetImageId !== undefined ? options.maskTargetImageId : round.maskTargetImageId ?? null,
         maskImageId: options.maskImageId !== undefined ? options.maskImageId : round.maskImageId ?? null,
@@ -4044,6 +4060,58 @@ async function executeAgentRound(
       }
     }
 
+    // 带图像 profile 轮换的 callImageApi 包装：失败后切换下一个 imageProfile 重试。
+    const callImageApiWithFallback = async (opts: {
+      taskId: string
+      prompt: string
+      referenceImageDataUrls: string[]
+      taskParams: TaskParams
+      signal: AbortSignal
+      onPartialImage?: (event: { image: string; partialImageIndex?: number }) => void | Promise<void>
+    }, _currentIndex: number): Promise<ReturnType<typeof callImageApi>> => {
+      try {
+        return await callImageApi({
+          settings: getImageRequestSettings(),
+          prompt: replaceImageMentionsForApi(opts.prompt, opts.referenceImageDataUrls.length),
+          params: opts.taskParams,
+          inputImageDataUrls: opts.referenceImageDataUrls,
+          onPartialImage: opts.onPartialImage
+            ? (partial) => {
+                void opts.onPartialImage?.({ image: partial.image, partialImageIndex: partial.partialImageIndex ?? partial.requestIndex })
+              }
+            : undefined,
+          onFalRequestEnqueued: (request) => {
+            updateTaskInStore(opts.taskId, {
+              falRequestId: request.requestId,
+              falEndpoint: request.endpoint,
+              falRecoverable: false,
+            })
+          },
+          onCustomTaskEnqueued: (request) => {
+            updateTaskInStore(opts.taskId, {
+              customTaskId: request.taskId,
+              customRecoverable: false,
+            })
+          },
+        })
+      } catch (err) {
+        if (opts.signal.aborted) throw err
+        // 切换下一个图像 profile 重试
+        if (imageProfileIndex < imageProfileChain.length - 1) {
+          imageProfileIndex += 1
+          updateTaskInStore(opts.taskId, {
+            apiProvider: getImageProfile().provider,
+            apiProfileId: getImageProfile().id,
+            apiProfileName: getImageProfile().name,
+            apiMode: getImageProfile().apiMode,
+            apiModel: getImageProfile().model,
+          })
+          return callImageApiWithFallback(opts, imageProfileIndex)
+        }
+        throw err
+      }
+    }
+
     const callHybridImageApiSingle = async (opts: {
       taskId: string
       prompt: string
@@ -4052,30 +4120,7 @@ async function executeAgentRound(
       signal: AbortSignal
       onPartialImage?: (event: { image: string; partialImageIndex?: number }) => void | Promise<void>
     }) => {
-      const result = await callImageApi({
-        settings: imageRequestSettings,
-        prompt: replaceImageMentionsForApi(opts.prompt, opts.referenceImageDataUrls.length),
-        params: opts.taskParams,
-        inputImageDataUrls: opts.referenceImageDataUrls,
-        onPartialImage: opts.onPartialImage
-          ? (partial) => {
-              void opts.onPartialImage?.({ image: partial.image, partialImageIndex: partial.partialImageIndex ?? partial.requestIndex })
-            }
-          : undefined,
-        onFalRequestEnqueued: (request) => {
-          updateTaskInStore(opts.taskId, {
-            falRequestId: request.requestId,
-            falEndpoint: request.endpoint,
-            falRecoverable: false,
-          })
-        },
-        onCustomTaskEnqueued: (request) => {
-          updateTaskInStore(opts.taskId, {
-            customTaskId: request.taskId,
-            customRecoverable: false,
-          })
-        },
-      })
+      const result = await callImageApiWithFallback(opts, imageProfileIndex)
       if (opts.signal.aborted) throw createAgentAbortError()
       const dataUrl = result.images[0]
       return {
@@ -4105,7 +4150,7 @@ async function executeAgentRound(
       const references = await resolveReferenceImages(referenceIds)
       const toolCallId = callId || genId()
       const taskParams = {
-        ...normalizeParamsForSettings(params, imageRequestSettings, { hasInputImages: references.dataUrls.length > 0 }),
+        ...normalizeParamsForSettings(params, getImageRequestSettings(), { hasInputImages: references.dataUrls.length > 0 }),
         n: 1,
       }
 
@@ -4169,7 +4214,7 @@ async function executeAgentRound(
         const batchToolCallId = genId()
         const taskParams = requestSettings.agentApiConfigMode === 'hybrid'
           ? {
-              ...normalizeParamsForSettings(params, imageRequestSettings, { hasInputImages: references.dataUrls.length > 0 }),
+              ...normalizeParamsForSettings(params, getImageRequestSettings(), { hasInputImages: references.dataUrls.length > 0 }),
               n: 1,
             }
           : { ...params, n: 1 }
@@ -4181,6 +4226,61 @@ async function executeAgentRound(
           ...(callId ? { agentBatchCallId: callId } : {}),
         })
         batchExecutionItems.push({ item, batchToolCallId, references, referenceIds, taskParams })
+      }
+
+      // 带图像 profile 轮换的 callBatchImageSingle 包装
+      const callBatchImageSingleWithFallback = async (opts: {
+        batchToolCallId: string
+        item: typeof batchItems[number]
+        taskParams: TaskParams
+        references: { dataUrls: string[]; imageIds: string[] }
+        referenceIds: string[]
+        shouldStreamAssistantMessage: boolean
+      }): Promise<ReturnType<typeof callBatchImageSingle>> => {
+        const attempt = async (tryIndex: number): Promise<ReturnType<typeof callBatchImageSingle>> => {
+          if (imageProfileIndex !== tryIndex) imageProfileIndex = tryIndex
+          try {
+            return await callBatchImageSingle({
+              profile: getImageProfile(),
+              params: opts.taskParams,
+              batchItemId: opts.item.id,
+              prompt: opts.item.prompt,
+              referenceImageDataUrls: opts.references.dataUrls,
+              referenceIds: opts.referenceIds,
+              allowPromptRewrite: requestSettings.allowPromptRewrite,
+              signal: controller.signal,
+              onImageToolStarted: opts.shouldStreamAssistantMessage
+                ? async () => { if (controller.signal.aborted) return }
+                : undefined,
+              onPartialImage: opts.shouldStreamAssistantMessage
+                ? async ({ image, partialImageIndex }) => {
+                    if (controller.signal.aborted) return
+                    const taskId = taskIdByToolCallId.get(opts.batchToolCallId)
+                    if (taskId) {
+                      useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
+                      if (partialImageIndex === 0 || partialImageIndex == null) {
+                        void persistTaskStreamPartialImage(taskId, image)
+                      }
+                    }
+                  }
+                : undefined,
+              onImageToolCompleted: opts.shouldStreamAssistantMessage
+                ? async (image) => {
+                    if (controller.signal.aborted) return
+                    await completeAgentImageTask({ ...image, toolCallId: opts.batchToolCallId })
+                  }
+                : undefined,
+            })
+          } catch (err) {
+            if (controller.signal.aborted) throw err
+            if (imageProfileIndex < imageProfileChain.length - 1) {
+              imageProfileIndex += 1
+              return attempt(imageProfileIndex)
+            }
+            throw err
+          }
+        }
+        return attempt(imageProfileIndex)
       }
 
       // Fire all batch items concurrently after all cards are visible.
@@ -4205,38 +4305,13 @@ async function executeAgentRound(
                 },
               })),
             }
-          : await callBatchImageSingle({
-              profile: imageProfile,
-              params: taskParams,
-              batchItemId: item.id,
-              prompt: item.prompt,
-              referenceImageDataUrls: references.dataUrls,
+          : await callBatchImageSingleWithFallback({
+              batchToolCallId,
+              item,
+              taskParams,
+              references,
               referenceIds,
-              allowPromptRewrite: requestSettings.allowPromptRewrite,
-              signal: controller.signal,
-              onImageToolStarted: shouldStreamAssistantMessage
-                ? async () => {
-                    if (controller.signal.aborted) return
-                  }
-                : undefined,
-              onPartialImage: shouldStreamAssistantMessage
-                ? async ({ image, partialImageIndex }) => {
-                    if (controller.signal.aborted) return
-                    const taskId = taskIdByToolCallId.get(batchToolCallId)
-                    if (taskId) {
-                      useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
-                      if (partialImageIndex === 0 || partialImageIndex == null) {
-                        void persistTaskStreamPartialImage(taskId, image)
-                      }
-                    }
-                  }
-                : undefined,
-              onImageToolCompleted: shouldStreamAssistantMessage
-                ? async (image) => {
-                    if (controller.signal.aborted) return
-                    await completeAgentImageTask({ ...image, toolCallId: batchToolCallId })
-                  }
-                : undefined,
+              shouldStreamAssistantMessage,
             })
 
         if (controller.signal.aborted) throw createAgentAbortError()
@@ -4289,72 +4364,102 @@ async function executeAgentRound(
       return JSON.stringify({ images: outputImages })
     }
 
+    // 文本模型轮换候选链：首个为 activeProfile，失败后依次切换。
+    const textProfileChain = [activeProfile, ...textFallbackProfiles]
+    let textProfileIndex = 0
+
     while (true) {
       if (controller.signal.aborted) throw createAgentAbortError()
       if (reachedToolLimit) break
       const textBeforeResponse = accumulatedText
+      const outputItemsBeforeResponse = accumulatedOutputItems
       let currentResponseOutputItems: ResponsesOutputItem[] = []
-      const result = await callAgentResponsesApi({
-        settings: requestSettings,
-        profile: activeProfile,
-        params,
-        input: apiInputForTurn,
-        maskDataUrl,
-        signal: controller.signal,
-        onTextDelta: shouldStreamAssistantMessage
-          ? (delta) => {
-              if (controller.signal.aborted) return
-              if (pendingToolTextSeparator && delta && accumulatedText.trim()) {
-                accumulatedText += '\n\n'
-                appendAgentAssistantMessageContent(conversationId, assistantMessageId, '\n\n')
+      const currentTextProfile = textProfileChain[textProfileIndex]
+      let result: AgentApiResult | null = null
+      try {
+        result = await callAgentResponsesApi({
+          settings: createSettingsForApiProfile(requestSettings, currentTextProfile),
+          profile: currentTextProfile,
+          params,
+          input: apiInputForTurn,
+          maskDataUrl,
+          signal: controller.signal,
+          onTextDelta: shouldStreamAssistantMessage
+            ? (delta) => {
+                if (controller.signal.aborted) return
+                if (pendingToolTextSeparator && delta && accumulatedText.trim()) {
+                  accumulatedText += '\n\n'
+                  appendAgentAssistantMessageContent(conversationId, assistantMessageId, '\n\n')
+                }
+                pendingToolTextSeparator = false
+                accumulatedText += delta
+                appendAgentAssistantMessageContent(conversationId, assistantMessageId, delta)
               }
-              pendingToolTextSeparator = false
-              accumulatedText += delta
-              appendAgentAssistantMessageContent(conversationId, assistantMessageId, delta)
-            }
-          : undefined,
-        onOutputItems: shouldStreamAssistantMessage
-          ? (outputItems) => {
-              if (controller.signal.aborted) return
-              currentResponseOutputItems = outputItems
-              updateAgentConversation(conversationId, (current) => ({
-                ...current,
-                rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
-              }))
-            }
-          : undefined,
-        onImageToolStarted: shouldStreamAssistantMessage
-          ? async ({ toolCallId }) => {
-              if (controller.signal.aborted) return
-              await ensureStreamingAgentTask(toolCallId)
-            }
-          : undefined,
-        onImagePartialImage: shouldStreamAssistantMessage
-          ? async ({ toolCallId, image, partialImageIndex }) => {
-              if (controller.signal.aborted) return
-              const taskId = await ensureStreamingAgentTask(toolCallId)
-              if (controller.signal.aborted) return
-              useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
-              if (partialImageIndex === 0 || partialImageIndex == null) {
-                void persistTaskStreamPartialImage(taskId, image)
+            : undefined,
+          onOutputItems: shouldStreamAssistantMessage
+            ? (outputItems) => {
+                if (controller.signal.aborted) return
+                currentResponseOutputItems = outputItems
+                updateAgentConversation(conversationId, (current) => ({
+                  ...current,
+                  rounds: current.rounds.map((item) => item.id === roundId ? { ...item, responseOutput: mergeResponseOutputItems(accumulatedOutputItems, outputItems) } : item),
+                }))
               }
-            }
-          : undefined,
-        onImageToolCompleted: shouldStreamAssistantMessage
-          ? async (image) => {
-              if (controller.signal.aborted) return
-              await completeAgentImageTask(image)
-            }
-          : undefined,
-        onImageToolFailed: shouldStreamAssistantMessage
-          ? async ({ toolCallId, error }) => {
-              if (controller.signal.aborted) return
-              await ensureStreamingAgentTask(toolCallId)
-              if (controller.signal.aborted) return
-              failAgentImageTask(toolCallId, error)
-            }
-          : undefined,
-      })
+            : undefined,
+          onImageToolStarted: shouldStreamAssistantMessage
+            ? async ({ toolCallId }) => {
+                if (controller.signal.aborted) return
+                await ensureStreamingAgentTask(toolCallId)
+              }
+            : undefined,
+          onImagePartialImage: shouldStreamAssistantMessage
+            ? async ({ toolCallId, image, partialImageIndex }) => {
+                if (controller.signal.aborted) return
+                const taskId = await ensureStreamingAgentTask(toolCallId)
+                if (controller.signal.aborted) return
+                useStore.getState().setTaskStreamPreview(taskId, image, partialImageIndex)
+                if (partialImageIndex === 0 || partialImageIndex == null) {
+                  void persistTaskStreamPartialImage(taskId, image)
+                }
+              }
+            : undefined,
+          onImageToolCompleted: shouldStreamAssistantMessage
+            ? async (image) => {
+                if (controller.signal.aborted) return
+                await completeAgentImageTask(image)
+              }
+            : undefined,
+          onImageToolFailed: shouldStreamAssistantMessage
+            ? async ({ toolCallId, error }) => {
+                if (controller.signal.aborted) return
+                await ensureStreamingAgentTask(toolCallId)
+                if (controller.signal.aborted) return
+                failAgentImageTask(toolCallId, error)
+              }
+            : undefined,
+        })
+      } catch (err) {
+        if (controller.signal.aborted) throw createAgentAbortError()
+        // 还有可轮换的文本 profile 时，回滚本轮已写入内容并切换重试
+        if (textProfileIndex < textProfileChain.length - 1) {
+          textProfileIndex += 1
+          accumulatedText = textBeforeResponse
+          accumulatedOutputItems = outputItemsBeforeResponse
+          if (shouldStreamAssistantMessage) {
+            updateAgentConversation(conversationId, (current) => ({
+              ...current,
+              messages: current.messages.map((message) =>
+                message.id === assistantMessageId ? { ...message, content: accumulatedText, outputTaskIds: [] } : message,
+              ),
+              rounds: current.rounds.map((item) =>
+                item.id === roundId ? { ...item, responseOutput: accumulatedOutputItems } : item,
+              ),
+            }))
+          }
+          continue
+        }
+        throw err
+      }
       if (controller.signal.aborted) throw createAgentAbortError()
 
       lastResponseId = result.responseId ?? lastResponseId
@@ -4407,11 +4512,11 @@ async function executeAgentRound(
           id: genId(),
           prompt: image.revisedPrompt ?? round?.prompt ?? userMessage.content,
           params,
-          apiProvider: imageProfile.provider,
-          apiProfileId: imageProfile.id,
-          apiProfileName: imageProfile.name,
-          apiMode: imageProfile.apiMode,
-          apiModel: imageProfile.model,
+          apiProvider: getImageProfile().provider,
+          apiProfileId: getImageProfile().id,
+          apiProfileName: getImageProfile().name,
+          apiMode: getImageProfile().apiMode,
+          apiModel: getImageProfile().model,
           inputImageIds: uniqueIds([...(round?.inputImageIds ?? []), ...promptRefs.imageIds]),
           maskTargetImageId: round?.maskTargetImageId ?? null,
           maskImageId: round?.maskImageId ?? null,

@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { normalizeBaseUrl } from '../lib/api'
-import { isApiProxyAvailable, isApiProxyLocked, readClientDevProxyConfig } from '../lib/devProxy'
+import { isApiProxyAvailable, isApiProxyLocked, readClientDevProxyConfig, buildApiUrl } from '../lib/devProxy'
 import { useStore, exportData, importData, clearData, type SettingsTab } from '../store'
 import {
   createDefaultOpenAIProfile,
@@ -41,6 +41,9 @@ import AgentSettingsTab from './settings/AgentSettingsTab'
 function newId(prefix: string) {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
 }
+
+const getDefaultModelForMode = (apiMode: AppSettings['apiMode']) =>
+  apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL
 
 const ADD_CUSTOM_PROVIDER_VALUE = '__add_custom_provider__'
 const COPY_IMPORT_URL_OPTIONS_STORAGE_KEY = 'gpt-image-playground.copy-import-url-options'
@@ -355,6 +358,10 @@ export default function SettingsModal() {
   const profileTouchDragRef = useRef<{ id: string, startX: number, startY: number, moved: boolean } | null>(null)
   const [copyImportUrlProfile, setCopyImportUrlProfile] = useState<ApiProfile | null>(null)
   const [copyImportUrlOptions, setCopyImportUrlOptions] = useState<CopyImportUrlOptions>(readCopyImportUrlOptions)
+  const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [modelLoading, setModelLoading] = useState(false)
+  const [modelError, setModelError] = useState('')
+  const [modelMenuOpen, setModelMenuOpen] = useState(false)
 
   const apiProxyConfig = readClientDevProxyConfig()
   const apiProxyAvailable = isApiProxyAvailable(apiProxyConfig)
@@ -400,8 +407,17 @@ export default function SettingsModal() {
     })
   ]
 
-  const getDefaultModelForMode = (apiMode: AppSettings['apiMode']) =>
-    apiMode === 'responses' ? DEFAULT_RESPONSES_MODEL : DEFAULT_IMAGES_MODEL
+  const modelSelectOptions = useMemo(() => {
+    const placeholder = activeProfile.provider === 'fal'
+      ? DEFAULT_FAL_MODEL
+      : getDefaultModelForMode(activeProfile.apiMode ?? DEFAULT_SETTINGS.apiMode)
+    const items = modelOptions.filter((m) => m && m !== activeProfile.model)
+
+    return [
+      { label: activeProfile.model || placeholder, value: activeProfile.model || '' },
+      ...items.map((m) => ({ label: m, value: m })),
+    ]
+  }, [activeProfile.apiMode, activeProfile.model, activeProfile.provider, modelOptions])
 
   const enabledZipDownloadRouteCount = ZIP_DOWNLOAD_ROUTE_OPTIONS
     .filter((option) => draft.zipDownloadRoutes.includes(option.route))
@@ -671,6 +687,42 @@ export default function SettingsModal() {
     const nextDraft = getDraftWithActiveProfilePatch(patch)
     commitSettings(nextDraft)
   }
+
+  const fetchModels = useCallback(async () => {
+    if (!activeProfile.baseUrl) {
+      setModelError('请先填写 Base URL')
+      return
+    }
+    if (!apiProxyEnabled && !activeProfile.apiKey) {
+      setModelError('请先填写 API Key')
+      return
+    }
+    setModelLoading(true)
+    setModelError('')
+    try {
+      const url = buildApiUrl(activeProfile.baseUrl, 'models', apiProxyConfig, apiProxyEnabled)
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${activeProfile.apiKey}` },
+      })
+      const data = await res.json().catch(() => null) as {
+        data?: Array<{ id: string }>
+        error?: { message?: string; type?: string }
+      } | null
+      if (!res.ok) {
+        const errorType = data?.error?.type?.trim()
+        const errorMessage = data?.error?.message?.trim()
+        const details = [errorType, errorMessage].filter(Boolean).join(': ')
+        throw new Error(details || `HTTP ${res.status}`)
+      }
+      const ids = data?.data?.map((m) => m.id).filter(Boolean) || []
+      setModelOptions(ids)
+    } catch (err: unknown) {
+      setModelError(err instanceof Error ? err.message : '获取模型列表失败')
+      console.error('获取模型列表失败:', err)
+    } finally {
+      setModelLoading(false)
+    }
+  }, [activeProfile.apiKey, activeProfile.baseUrl, activeProfile.provider, apiProxyEnabled, apiProxyConfig])
 
   const handleClose = () => {
     if (showZipDownloadRouteManager) {
@@ -1596,14 +1648,65 @@ export default function SettingsModal() {
                 <span className="mb-1.5 block text-sm text-gray-600 dark:text-gray-300">
                   模型 ID
                 </span>
-                <input
-                  value={activeProfile.model}
-                  onChange={(e) => updateActiveProfile({ model: e.target.value })}
-                  onBlur={(e) => commitActiveProfilePatch({ model: e.target.value })}
-                  type="text"
-                  placeholder={activeProfile.provider === 'fal' ? DEFAULT_FAL_MODEL : getDefaultModelForMode(activeProfile.apiMode ?? DEFAULT_SETTINGS.apiMode)}
-                  className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
-                />
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      value={activeProfile.model}
+                      onChange={(e) => {
+                        updateActiveProfile({ model: e.target.value })
+                        if (!modelMenuOpen) setModelMenuOpen(true)
+                      }}
+                      onFocus={() => setModelMenuOpen(true)}
+                      onBlur={(e) => {
+                        window.setTimeout(() => setModelMenuOpen(false), 120)
+                        commitActiveProfilePatch({ model: e.target.value })
+                      }}
+                      placeholder={activeProfile.provider === 'fal' ? DEFAULT_FAL_MODEL : getDefaultModelForMode(activeProfile.apiMode ?? DEFAULT_SETTINGS.apiMode)}
+                      className="w-full rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 pr-9 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-200 dark:focus:border-blue-500/50"
+                    />
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setModelMenuOpen((open) => !open)}
+                      className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-gray-400 transition hover:text-gray-500 dark:text-gray-500 dark:hover:text-gray-400"
+                      aria-label="切换模型列表"
+                    >
+                      <ChevronDownIcon className={`h-3.5 w-3.5 transition-transform duration-200 ${modelMenuOpen ? 'rotate-180' : ''}`} />
+                    </button>
+                    {modelMenuOpen && modelSelectOptions.length > 0 && (
+                      <div className="absolute top-full z-50 mt-1.5 w-full overflow-hidden overflow-y-auto rounded-xl border border-gray-200/60 bg-white/95 py-1 shadow-[0_8px_30px_rgb(0,0,0,0.12)] ring-1 ring-black/5 backdrop-blur-xl dark:border-white/[0.08] dark:bg-gray-900/95 dark:shadow-[0_8px_30px_rgb(0,0,0,0.3)] dark:ring-white/10 custom-scrollbar max-h-[min(20rem,calc(100vh-6rem))] animate-dropdown-down">
+                        {modelSelectOptions.map((option) => (
+                          <button
+                            key={String(option.value) || '__default__'}
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => {
+                              updateActiveProfile({ model: String(option.value) }, true)
+                              setModelMenuOpen(false)
+                            }}
+                            className="block w-full truncate px-3 py-2 text-left text-sm text-gray-700 transition hover:bg-gray-100/80 dark:text-gray-200 dark:hover:bg-white/[0.06]"
+                            title={option.label}
+                          >
+                            {option.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {(activeProviderIsOpenAICompatible || activeProfile.provider === 'openai') && (
+                    <button
+                      type="button"
+                      onClick={fetchModels}
+                      disabled={modelLoading}
+                      className="whitespace-nowrap rounded-xl border border-gray-200/70 bg-white/60 px-3 py-2.5 text-sm text-gray-600 transition hover:bg-gray-50 disabled:opacity-50 dark:border-white/[0.08] dark:bg-white/[0.03] dark:text-gray-300 dark:hover:bg-white/[0.06]"
+                    >
+                      {modelLoading ? '加载中...' : '获取模型'}
+                    </button>
+                  )}
+                </div>
+                {modelError && (
+                  <div className="mt-1.5 text-xs text-red-500 dark:text-red-400">{modelError}</div>
+                )}
                 <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
                   {activeProfile.provider === 'fal' ? (
                     <>当前适配 <code className="rounded bg-gray-100 px-1 py-0.5 dark:bg-white/[0.06]">{DEFAULT_FAL_MODEL}</code>。</>
